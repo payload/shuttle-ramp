@@ -11,37 +11,84 @@
     <button id="btn-offer-file">Offer file</button>
     <button id="btn-accept-file">Accept file</button>
     <script type="module">
-        main();
 
         async function main() {
-            document.getElementById('btn-offer-file').addEventListener('click', offerFile);
-            document.getElementById('btn-accept-file').addEventListener('click', acceptFile);
+            document.getElementById('btn-offer-file').addEventListener('click', () => offerFile());
+            document.getElementById('btn-accept-file').addEventListener('click', () => acceptFile());
 
             const roomid = '1234';
             let room_message_matchers = [];
-            get_room_messages('1234', handle_room_message);
+            await get_room_messages('1234', handle_room_message);
 
             const method = /method=(\w+)/.exec(window.location.hash);
             if (method) {
-                ({ offerFile, acceptFile })[method[1]]?.();
+                ({
+                    offerFile: () => offerFile(fakeOpenFileDialog),
+                    acceptFile: () => acceptFile(fakeSaveFileDialog),
+                })[method[1]]?.();
             }
 
-            async function offerFile() {
+            async function offerFile(fakeOpenFileDialog) {
                 console.debug('offerFile');
+                const filePicker = fakeOpenFileDialog ? fakeOpenFileDialog() : openFileDialog();
+                const accept_file_offer_connection = on_room_message(roomid, { msg: 'accept_file_offer_connection', file: 5 });
                 await post_room_message(roomid, { msg: 'offer_file', file: 5 });
-                const { offer_sdp } = await on_room_message(roomid, { msg: 'accept_file_offer_connection', file: 5 });
-                const connection = await new_answering_connection(offer_sdp);
-                await post_room_message(roomid, { msg: 'answer_connection', answer_sdp: connection.localDescription.sdp });
+                const { offer_sdp } = await accept_file_offer_connection;
+                const connection = new AnsweringConnection();
+                const answer_sdp = await connection.create_complete_answer(offer_sdp);
+                await post_room_message(roomid, { msg: 'answer_connection', answer_sdp });
+                await connection.until_channel_open();
+                const file = await filePicker;
+                console.log('stream file', to_mb(file.size));
+                const receivedEOF = new Promise((resolve) => connection.channel.onmessage = (ev) => {
+                    if (typeof ev.data === 'string') {
+                        for (const line of ev.data.split('\n')) {
+                            if (line === 'EOF') resolve();
+                        }
+                    }
+                });
+
+                await file.stream().pipeTo(new WritableStream({
+                    async write(chunk, ctrl) {
+                        const sliceSize = connection.channel.bufferedAmountLowThreshold;
+                        const slices = Math.ceil(chunk.byteLength / sliceSize);
+                        console.log(`${now()} chunk ${to_mb(chunk.byteLength)} ${slices} slices. ${chunk.byteLength} bytes`);
+                        for (let start = 0; start < chunk.buffer.byteLength; start += sliceSize) {
+                            const end = Math.min(chunk.byteLength, start + sliceSize);
+                            const slice = chunk.buffer.slice(start, end);
+                            connection.channel.send(slice);
+
+                            if (connection.channel.bufferedAmount > connection.channel.bufferedAmountLowThreshold) {
+                                await connection.until_buffered_amount_low();
+                            }
+                        }
+                    }
+                }, new ByteLengthQueuingStrategy({ highWaterMark: connection.channel.bufferedAmountLowThreshold }))).then(DONE('stream file'));
+
+                if (connection.channel.readyState === "open") {
+                    connection.channel.send('EOF');
+                } else {
+                    console.error('channel not open anymore :(');
+                }
+
+                await receivedEOF.then(DONE('EOF'));
+                await connection.close_channel();
                 console.debug('offerFile: DONE');
             }
 
-            async function acceptFile() {
+            async function acceptFile(fakeSaveFileDialog) {
                 console.debug('acceptFile');
+                const connection = new OfferingConnection();
+                const offer_sdp = await connection.create_complete_offer();
                 const { file } = await on_room_message(roomid, { msg: 'offer_file' });
-                const connection = await new_offering_connection();
-                await post_room_message(roomid, { msg: 'accept_file_offer_connection', file, offer_sdp: connection.localDescription.sdp });
+                const fileWriter = await (fakeSaveFileDialog ? fakeSaveFileDialog() : saveFileDialog());
+                await post_room_message(roomid, { msg: 'accept_file_offer_connection', file, offer_sdp });
                 const { answer_sdp } = await on_room_message(roomid, { msg: 'answer_connection' });
-                await connection.setRemoteDescription({ type: 'answer', sdp: answer_sdp }).then(DONE('setRemoteDescription'));
+                await connection.set_answer_sdp(answer_sdp);
+                await connection.until_channel_open();
+                connection.ondata = (data) => fileWriter.write(data);
+                await connection.until_channel_close();
+                await fileWriter.close();
                 console.debug('acceptFile: DONE');
             }
 
@@ -53,7 +100,7 @@
             }
 
             async function handle_room_message(roomid, message) {
-                console.log(`%cRECV ${roomid} ${pretty(message)}`, 'color:lightgreen;font-weight:bold');
+                console.log(`%cRECV ${roomid} ${pretty(message)}`, 'color:mediumspringgreen;font-weight:bold');
                 // TODO never rejects, when to reject?
                 const resolving = [];
                 room_message_matchers = room_message_matchers.filter(({ on_roomid, matcher, resolve, reject }) => {
@@ -62,31 +109,115 @@
                     if (matching) resolving.push(resolve);
                     return !matching;
                 });
+                if (resolving.length === 0) {
+                    console.warn('unexpected message', message, 'matchers', room_message_matchers.map(e => e.matcher));
+                }
                 resolving.forEach(resolve => resolve(message));
             }
         }
 
-        async function new_offering_connection() {
-            const connection = new RTCPeerConnection();
-            const channel = connection.createDataChannel('ramp');
-            log_connection_events(connection);
-            log_data_channel_events(channel);
-            const iceComplete = untilIceComplete(connection);
-            await connection.createOffer().then(DONE('createOffer'));
-            await connection.setLocalDescription().then(DONE('setLocalDescription'));
-            await iceComplete.then(DONE('iceComplete'));
-            return { connection, channel };
+        class OfferingConnection {
+            connection = new RTCPeerConnection();
+            channel = this.connection.createDataChannel('ramp');
+            channel_open = undefined
+            ondata = undefined
+
+            constructor() {
+                // First attach loggers than attach other event handlers, to ensure order these loggers log first.
+                log_connection_events(this.connection);
+                log_data_channel_events(this.channel);
+                log_data_channel_state(this.channel);
+                this.channel_open = new Promise((resolve) => this.channel.addEventListener('open', resolve, { once: true }));
+                this.channel.addEventListener('message', this.handle_channel_message.bind(this));
+            }
+
+            async create_complete_offer() {
+                const { connection } = this;
+                const iceComplete = untilIceComplete(connection);
+                await connection.createOffer().then(DONE('createOffer'));
+                await connection.setLocalDescription().then(DONE('setLocalDescription'));
+                await iceComplete;
+                return connection.localDescription.sdp;
+            }
+
+            async set_answer_sdp(answer_sdp) {
+                await this.connection.setRemoteDescription({ type: 'answer', sdp: answer_sdp }).then(DONE('setRemoteDescription'));
+            }
+
+            async until_channel_open() {
+                await this.channel_open;
+                return this.channel;
+            }
+
+            async until_channel_close() {
+                if (this.channel.readyState !== 'closed') {
+                    await new Promise(resolve => this.channel.addEventListener('close', resolve));
+                }
+            }
+
+            async handle_channel_message(ev) {
+                if (ev.data instanceof ArrayBuffer) {
+                    /** @type ArrayBuffer */
+                    const buf = ev.data;
+                    await this.ondata?.(buf);
+                } else if (typeof ev.data === 'string') {
+                    console.log('channel message:', ev.data);
+                    for (const line of ev.data.split('\n')) {
+                        if (line === 'EOF') {
+                            this.channel.send('EOF');
+                        }
+                    }
+                } else {
+                    console.error('channel message unknown type', ev.data);
+                }
+            }
         }
 
-        async function new_answering_connection(offer_sdp) {
-            const connection = new RTCPeerConnection();
-            log_connection_events(connection);
-            const iceComplete = untilIceComplete(connection);
-            await connection.setRemoteDescription({ type: "offer", sdp: offer_sdp }).catch(debugCatch({ offer_sdp }));
-            await connection.createAnswer();
-            await connection.setLocalDescription();
-            await iceComplete;
-            return connection;
+        class AnsweringConnection {
+            connection = new RTCPeerConnection();
+            /** @type {RTCDataChannel} */
+            channel = undefined
+            channel_open = undefined;
+
+            constructor() {
+                // First attach loggers than attach other event handlers, to ensure order these loggers log first.
+                log_connection_events(this.connection);
+                this.channel_open = new Promise((resolve) => this.connection.addEventListener('datachannel', resolve, { once: true }));
+            }
+
+            async create_complete_answer(offer_sdp) {
+                const { connection } = this;
+                const iceComplete = untilIceComplete(connection);
+                await connection.setRemoteDescription({ type: "offer", sdp: offer_sdp }).then(DONE('setRemoteDescription')).catch(debugCatch({ offer_sdp }));
+                await connection.createAnswer().then(DONE('createAnswer'));
+                await connection.setLocalDescription().then(DONE('setLocalDescription'));
+                await iceComplete;
+                return connection.localDescription.sdp;
+            }
+
+            async until_channel_open() {
+                const ev = await this.channel_open;
+                this.channel = ev.channel;
+                log_data_channel_events(this.channel);
+                log_data_channel_state(this.channel);
+                this.channel.bufferedAmountLowThreshold = 65536;
+                return this.channel;
+            }
+
+            async until_buffered_amount_low() {
+                await new Promise(resolve => this.channel.addEventListener('bufferedamountlow', resolve, { once: true }));
+            }
+
+            async until_channel_close() {
+                if (this.channel.readyState !== 'closed') {
+                    await new Promise(resolve => this.channel.addEventListener('close', resolve, { once: true }));
+                }
+            }
+
+            async close_channel() {
+                this.channel.close();
+                await this.until_channel_close();
+            }
         }
 
         function untilIceComplete(connection) {
@@ -103,10 +234,29 @@
             });
         }
 
-        async function openFilePicker() {
+        async function openFileDialog() {
             const [fileHandle] = await window.showOpenFilePicker({ id: 'offer-file' });
+            /** @type {File} */
             const file = await fileHandle.getFile();
-            console.log(' file', await file.text());
+            return file;
+        }
+
+        async function saveFileDialog() {
+            const fileHandle = await window.showSaveFilePicker({ id: 'ramp' });
+            return await fileHandle.createWritable();
+        }
+
+        async function fakeSaveFileDialog() {
+            return { write() { }, close() { } };
+        }
+
+        async function fakeOpenFileDialog() {
+            const chunks = [];
+            for (let i = 0; i < 10; i++) {
+                chunks.push(new Uint8Array(5000 * 1024).fill(23));
+                await new Promise(r => setTimeout(r), 1);
+            }
+            return new Blob(chunks);
         }
 
         function log_connection_events(c) {
@@ -130,13 +280,22 @@
             const [label, css] = ['%cchannel   ', 'color:cyan'];
             const log = console.debug.bind(console);
             [
-                ['bufferedamountlow', k => c.addEventListener(k, () => log(`${label} ${k}`, css))],
+                // ['bufferedamountlow', k => c.addEventListener(k, () => log(`${label} ${k}`, css))],
                 ['close', k => c.addEventListener(k, () => log(`${label} ${k}`, css))],
                 ['closing', k => c.addEventListener(k, () => log(`${label} ${k}`, css))],
                 ['error', k => c.addEventListener(k, () => log(`${label} ${k}`, css))],
-                ['message', k => c.addEventListener(k, () => log(`${label} ${k}`, css))],
+                ['message', k => c.addEventListener(k, (e) => log(`${label} ${k}`, css, e.data.length ?? e.data.byteLength))],
                 ['open', k => c.addEventListener(k, () => log(`${label} ${k}`, css))],
             ].forEach(([eventname, func]) => func(eventname));
+        }
+
+        function log_data_channel_state(c) {
+            const [label, css] = ['%cchannel   ', 'color:cyan'];
+            const log = console.debug.bind(console);
+            // let interval;
+            // interval = setInterval(function log_data_channel_state_handler() {
+            //     log(`${label} readyState ${c.readyState}`, css);
+            // }, 1000);
         }
 
         function connection_handle_offer_signalling(connection) {
@@ -153,18 +312,22 @@
         }
 
         async function post_room_message(roomid, body) {
-            console.log(`%cPOST ${roomid} ${pretty(body)}`, 'color:lightblue;font-weight:bold');
+            console.log(`%cPOST ${roomid} ${pretty(body)}`, 'color:lightgreen;font-weight:bold');
             const response = await fetch(`/${roomid}`, { method: 'POST', body: JSON.stringify(body), headers: json_headers() })
             const result = await response.json();
             return result;
         }
 
-        function get_room_messages(roomid, handler) {
-            const src = new EventSource(`/${roomid}`);
-            src.onmessage = (ev) => {
-                const json = JSON.parse(ev.data);
-                handler(roomid, json);
-            }
+        async function get_room_messages(roomid, handler) {
+            await new Promise((resolve, reject) => {
+                const src = new EventSource(`/${roomid}`);
+                src.onmessage = (ev) => {
+                    const json = JSON.parse(ev.data);
+                    handler(roomid, json);
+                }
+                src.onopen = resolve;
+                src.onerror = reject;
+            });
         }
 
         function json_headers() {
@@ -200,10 +363,21 @@
 
         function DONE(what) {
             return function (x) {
-                console.debug(`%cDONE ${what}`, 'color:orange;font-weight:bold');
+                console.debug(`%c${now()} DONE ${what}`, 'color:orange;font-weight:bold');
                 return x;
             };
         }
+
+        function to_mb(bytes) {
+            return (bytes / 1024 / 1024).toFixed(2) + ' MB';
+        }
+
+        const global_start_time = Date.now();
+        function now() {
+            return (Date.now() - global_start_time).toString();
+        }
+
+        main();
 
     </script>
 </body>
