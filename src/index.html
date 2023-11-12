@@ -21,18 +21,27 @@
             let room_message_matchers = [];
             get_room_messages('1234', handle_room_message);
 
+            const method = /method=(\w+)/.exec(window.location.hash);
+            if (method) {
+                ({ offerFile, acceptFile })[method[1]]?.();
+            }
+
             async function offerFile() {
                 console.debug('offerFile');
                 await post_room_message(roomid, { msg: 'offer_file', file: 5 });
-                await on_room_message(roomid, { msg: 'accept_file_offer_connection', file: 5 });
-                await post_room_message(roomid, { msg: 'answer_connection' });
+                const { offer_sdp } = await on_room_message(roomid, { msg: 'accept_file_offer_connection', file: 5 });
+                const connection = await new_answering_connection(offer_sdp);
+                await post_room_message(roomid, { msg: 'answer_connection', answer_sdp: connection.localDescription.sdp });
                 console.debug('offerFile: DONE');
             }
 
             async function acceptFile() {
                 console.debug('acceptFile');
                 const { file } = await on_room_message(roomid, { msg: 'offer_file' });
-                await post_room_message(roomid, { msg: 'accept_file_offer_connection', file });
+                const connection = await new_offering_connection();
+                await post_room_message(roomid, { msg: 'accept_file_offer_connection', file, offer_sdp: connection.localDescription.sdp });
+                const { answer_sdp } = await on_room_message(roomid, { msg: 'answer_connection' });
+                await connection.setRemoteDescription({ type: 'answer', sdp: answer_sdp }).then(DONE('setRemoteDescription'));
                 console.debug('acceptFile: DONE');
             }
 
@@ -49,34 +58,49 @@
                 const resolving = [];
                 room_message_matchers = room_message_matchers.filter(({ on_roomid, matcher, resolve, reject }) => {
                     if (on_roomid !== roomid) return true;
-                    const matching = Object.entries(matcher).reduce((p, [k, v]) => !!(p && k in message && typeof v === 'function' ? v(message[k]) : message[k] === v), true);
+                    const matching = Object.entries(matcher).reduce((p, [k, v]) => (!!p && k in message && (typeof v === 'function' ? !!v(message[k]) : message[k] === v)), true);
                     if (matching) resolving.push(resolve);
                     return !matching;
                 });
                 resolving.forEach(resolve => resolve(message));
-                // if (message.msg === 'offer_file') {
-                //     // create connection, offer, send accept file with offer
-                //     await post_room_message('1234', { msg: 'accept_file_offer_connection', file: message.file });
-                //     // on connection established, receive file
-                //     // on connection closed, tell user
-                // } else if (message.msg === 'accept_file_offer_connection') {
-                //     // create connection, set offer, create answer, send answer
-                //     await post_room_message('1234', { msg: 'answer_connection' })
-                //     // on connection established send file
-                //     // when file is sent, close connection
-                // } else if (message.msg === 'answer_connection') {
-                //     // connection, set answer
-                // }
             }
+        }
 
-            // const connection = new RTCPeerConnection();
-            // log_connection_events(connection)
+        async function new_offering_connection() {
+            const connection = new RTCPeerConnection();
+            const channel = connection.createDataChannel('ramp');
+            log_connection_events(connection);
+            log_data_channel_events(channel);
+            const iceComplete = untilIceComplete(connection);
+            await connection.createOffer().then(DONE('createOffer'));
+            await connection.setLocalDescription().then(DONE('setLocalDescription'));
+            await iceComplete.then(DONE('iceComplete'));
+            return { connection, channel };
+        }
 
-            // const channel = connection.createDataChannel('ramp');
-            // log_data_channel_events(channel);
+        async function new_answering_connection(offer_sdp) {
+            const connection = new RTCPeerConnection();
+            log_connection_events(connection);
+            const iceComplete = untilIceComplete(connection);
+            await connection.setRemoteDescription({ type: "offer", sdp: offer_sdp }).catch(debugCatch({ offer_sdp }));
+            await connection.createAnswer();
+            await connection.setLocalDescription();
+            await iceComplete;
+            return connection;
+        }
 
-            // const offer = await connection.createOffer();
-            // await connection.setLocalDescription(offer);
+        function untilIceComplete(connection) {
+            return new Promise(resolve => {
+                const abort = new AbortController();
+                connection.addEventListener('icegatheringstatechange', () => {
+                    if (connection.iceGatheringState === 'complete') {
+                        abort.abort('done');
+                        resolve();
+                    }
+                }, {
+                    signal: abort.signal
+                })
+            });
         }
 
         async function openFilePicker() {
@@ -85,36 +109,34 @@
             console.log(' file', await file.text());
         }
 
-        function log_connection_events(connection) {
-            for (const eventname of [
-                'connectionstatechange',
-                'datachannel',
-                'icecandidate',
-                'icecandidateerror',
-                'iceconnectionstatechange',
-                'icegatheringstatechange',
-                'negotiationneeded',
-                'signalingstatechange',
-                'track',
-            ]) {
-                connection.addEventListener(eventname, () => {
-                    console.log('connection', eventname);
-                    console.log('  iceGatheringState', connection.iceGatheringState)
-                });
-            }
+        function log_connection_events(c) {
+            const [label, css] = ['%cconnection', 'color:cyan'];
+            const log = console.debug.bind(console);
+            [
+                ['icegatheringstatechange', k => c.addEventListener(k, () => log(`${label} ${k} ${c.iceGatheringState}`, css))],
+                ['iceconnectionstatechange', k => c.addEventListener(k, () => log(`${label} ${k} ${c.iceConnectionState}`, css))],
+                ['connectionstatechange', k => c.addEventListener(k, () => log(`${label} ${k} ${c.connectionState}`, css))],
+                ['signalingstatechange', k => c.addEventListener(k, () => log(`${label} ${k} ${c.signalingState}`, css))],
+                ['datachannel', k => c.addEventListener(k, () => log(`${label} ${k}`, css))],
+                ['icecandidate', k => c.addEventListener(k, () => log(`${label} ${k}`, css))],
+                ['icecandidateerror', k => c.addEventListener(k, () => log(`${label} ${k}`, css))],
+                ['negotiationneeded', k => c.addEventListener(k, () => log(`${label} ${k}`, css))],
+                ['track', k => c.addEventListener(k, () => log(`${label} ${k}`, css))],
+            ].forEach(([eventname, func]) => func(eventname));
         }
 
-        function log_data_channel_events(channel) {
-            for (const eventname of [
-                'bufferedamountlow',
-                'close',
-                'closing',
-                'error',
-                'message',
-                'open',
-            ]) {
-                channel.addEventListener(eventname, () => console.log('channel', eventname));
-            }
+        function log_data_channel_events(c) {
+            //                       connection
+            const [label, css] = ['%cchannel   ', 'color:cyan'];
+            const log = console.debug.bind(console);
+            [
+                ['bufferedamountlow', k => c.addEventListener(k, () => log(`${label} ${k}`, css))],
+                ['close', k => c.addEventListener(k, () => log(`${label} ${k}`, css))],
+                ['closing', k => c.addEventListener(k, () => log(`${label} ${k}`, css))],
+                ['error', k => c.addEventListener(k, () => log(`${label} ${k}`, css))],
+                ['message', k => c.addEventListener(k, () => log(`${label} ${k}`, css))],
+                ['open', k => c.addEventListener(k, () => log(`${label} ${k}`, css))],
+            ].forEach(([eventname, func]) => func(eventname));
         }
 
         function connection_handle_offer_signalling(connection) {
@@ -152,12 +174,35 @@
         }
 
         function pretty(it) {
-            if (typeof it === 'object') {
+            if (!it) {
+                return String(it);
+            } else if (typeof it === 'object') {
                 const out = Object.entries(it).map(([k, v]) => `${k}:${pretty(v)}`)
                 return `{ ${out.join(', ')} }`;
+            } else if (typeof it === 'string') {
+                it = it.replace(/\n/g, '\\n');
+                return it.length > 80 ? it.slice(0, 77) + '...' : it;
             } else {
-                return it?.toString();
+                return it.toString();
             }
+        }
+
+        function debugCatch(attachment) {
+            return function debugCatchHandler(error) {
+                throw Error(`DebugCatch ${pretty(attachment)}\n${error.message}`, { cause: error });
+            };
+        }
+
+        function TAP(x) {
+            console.debug('TAP', pretty(x));
+            return x;
+        }
+
+        function DONE(what) {
+            return function (x) {
+                console.debug(`%cDONE ${what}`, 'color:orange;font-weight:bold');
+                return x;
+            };
         }
 
     </script>

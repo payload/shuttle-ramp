@@ -57,8 +57,8 @@ async fn post_room_message(
 #[serde(tag="msg", rename_all="snake_case")]
 enum RoomMessage {
     OfferFile { file: u32 },
-    AcceptFileOfferConnection { file: u32 },
-    AnswerConnection,
+    AcceptFileOfferConnection { file: u32, offer_sdp: String },
+    AnswerConnection { answer_sdp: String },
 }
 
 struct AppState {
