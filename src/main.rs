@@ -34,15 +34,12 @@ async fn get_index_html() -> response::Result<impl IntoResponse> {
 async fn get_room_messages(
     State(state): State<Arc<AppState>>,
     Path(roomid): Path<String>,
-) -> Response {
+) -> impl IntoResponse {
     let roomid = RoomId(roomid);
     let (sender, receiver) = tokio::sync::mpsc::channel(10);
-    if state.add_room_message_receiver(&roomid, sender) {
-        Sse::new(ReceiverStream::new(receiver).map(|data| Event::default().json_data(data)))
-            .into_response()
-    } else {
-        Json(map_1("msg", "no_room".to_string())).into_response()
-    }
+    state.ensure_room(&roomid);
+    state.add_room_message_receiver(&roomid, sender);
+    Sse::new(ReceiverStream::new(receiver).map(|data| Event::default().json_data(data)))
 }
 
 async fn post_room_message(
@@ -51,19 +48,17 @@ async fn post_room_message(
     Json(msg): Json<RoomMessage>,
 ) -> impl IntoResponse {
     let roomid = RoomId(roomid);
-    if state.rooms.contains_key(&roomid) {
-        state.send_message(&roomid, msg);
-        Json(map_1("msg", "room_exists,post_room_message".to_string()))
-    } else {
-        state.add_room(&roomid);
-        state.send_message(&roomid, msg);
-        Json(map_1("msg", "new_room,post_room_message".to_string()))
-    }
+    state.ensure_room(&roomid);
+    state.send_message(&roomid, msg);
+    Json(map_1("msg", "post_room_message".to_string()))
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
-struct RoomMessage {
-    msg: String,
+#[serde(tag="msg", rename_all="snake_case")]
+enum RoomMessage {
+    OfferFile { file: u32 },
+    AcceptFileOfferConnection { file: u32 },
+    AnswerConnection,
 }
 
 struct AppState {
@@ -77,16 +72,21 @@ impl AppState {
         }
     }
 
-    fn add_room(&self, id: &RoomId) {
-        tracing::info!("add_room {id:?}");
-        self.rooms.insert(
-            id.clone(),
-            Room {
-                id: id.clone(),
-                clients: DashMap::new(),
-                message_receivers: Vec::new(),
-            },
-        );
+    fn ensure_room(&self, id: &RoomId) -> bool {
+        if self.rooms.contains_key(id) {
+            true
+        } else {
+            tracing::info!("ensure_room {id:?}");
+            self.rooms.insert(
+                id.clone(),
+                Room {
+                    id: id.clone(),
+                    clients: DashMap::new(),
+                    message_receivers: Vec::new(),
+                },
+            );
+            false
+        }
     }
 
     fn add_room_message_receiver(&self, id: &RoomId, sender: Sender<Arc<RoomMessage>>) -> bool {
@@ -100,13 +100,13 @@ impl AppState {
         }
     }
 
-    fn send_message(&self, id: &RoomId, msg: RoomMessage) {
+    fn send_message(&self, id: &RoomId, msg: RoomMessage) -> bool {
         if let Some(mut room) = self.rooms.get_mut(id) {
-            let msg = Arc::new(msg);
             tracing::info!(
                 "send_message {id:?} receivers={}",
                 room.message_receivers.len()
             );
+            let msg = Arc::new(msg);
             room.message_receivers.retain(|receiver| {
                 match receiver.try_send(msg.clone()) {
                     Ok(_) => true,
@@ -117,6 +117,10 @@ impl AppState {
                     Err(TrySendError::Closed(_)) => false,
                 }
             });
+            true
+        } else {
+            tracing::warn!("send_message, no room {id:?}");
+            false
         }
     }
 }

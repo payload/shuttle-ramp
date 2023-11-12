@@ -9,40 +9,65 @@
 
 <body>
     <button id="btn-offer-file">Offer file</button>
+    <button id="btn-accept-file">Accept file</button>
     <script type="module">
         main();
 
         async function main() {
             document.getElementById('btn-offer-file').addEventListener('click', offerFile);
+            document.getElementById('btn-accept-file').addEventListener('click', acceptFile);
 
-            await loop_post_room_message();
+            const roomid = '1234';
+            let room_message_matchers = [];
             get_room_messages('1234', handle_room_message);
 
-            async function loop_post_room_message() {
-                const result = await post_room_message('1234', { msg: 'fun', time: Date.now() });
-                console.log(result);
-                setTimeout(loop_post_room_message, 10000);
+            async function offerFile() {
+                console.debug('offerFile');
+                await post_room_message(roomid, { msg: 'offer_file', file: 5 });
+                await on_room_message(roomid, { msg: 'accept_file_offer_connection', file: 5 });
+                await post_room_message(roomid, { msg: 'answer_connection' });
+                console.debug('offerFile: DONE');
+            }
+
+            async function acceptFile() {
+                console.debug('acceptFile');
+                const { file } = await on_room_message(roomid, { msg: 'offer_file' });
+                await post_room_message(roomid, { msg: 'accept_file_offer_connection', file });
+                console.debug('acceptFile: DONE');
+            }
+
+            function on_room_message(roomid, matcher) {
+                return new Promise((resolve, reject) => {
+                    // TODO never rejects
+                    room_message_matchers.push({ on_roomid: roomid, matcher, resolve, reject })
+                });
             }
 
             async function handle_room_message(roomid, message) {
-                if (message.msg === 'offer_file') {
-                    // create connection, offer, send accept file with offer
-                    await post_room_message('1234', { msg: 'accept_file_offer_connection', file: message.file });
-                    // on connection established, receive file
-                    // on connection closed, tell user
-                } else if (message.msg === 'accept_file_offer_connection') {
-                    // create connection, set offer, create answer, send answer
-                    await post_room_message('1234', { msg: 'answer_connection' })
-                    // on connection established send file
-                    // when file is sent, close connection
-                } else if (message.msg === 'answer_connection') {
-                    // connection, set answer
-                }
+                console.log(`%cRECV ${roomid} ${pretty(message)}`, 'color:lightgreen;font-weight:bold');
+                // TODO never rejects, when to reject?
+                const resolving = [];
+                room_message_matchers = room_message_matchers.filter(({ on_roomid, matcher, resolve, reject }) => {
+                    if (on_roomid !== roomid) return true;
+                    const matching = Object.entries(matcher).reduce((p, [k, v]) => !!(p && k in message && typeof v === 'function' ? v(message[k]) : message[k] === v), true);
+                    if (matching) resolving.push(resolve);
+                    return !matching;
+                });
+                resolving.forEach(resolve => resolve(message));
+                // if (message.msg === 'offer_file') {
+                //     // create connection, offer, send accept file with offer
+                //     await post_room_message('1234', { msg: 'accept_file_offer_connection', file: message.file });
+                //     // on connection established, receive file
+                //     // on connection closed, tell user
+                // } else if (message.msg === 'accept_file_offer_connection') {
+                //     // create connection, set offer, create answer, send answer
+                //     await post_room_message('1234', { msg: 'answer_connection' })
+                //     // on connection established send file
+                //     // when file is sent, close connection
+                // } else if (message.msg === 'answer_connection') {
+                //     // connection, set answer
+                // }
             }
-
-            await post_room_message('1234', { msg: 'ensure_room' })
-
-            await post_room_message('1234', { msg: 'ensure_room' })
 
             // const connection = new RTCPeerConnection();
             // log_connection_events(connection)
@@ -54,7 +79,7 @@
             // await connection.setLocalDescription(offer);
         }
 
-        async function offerFile() {
+        async function openFilePicker() {
             const [fileHandle] = await window.showOpenFilePicker({ id: 'offer-file' });
             const file = await fileHandle.getFile();
             console.log(' file', await file.text());
@@ -106,6 +131,7 @@
         }
 
         async function post_room_message(roomid, body) {
+            console.log(`%cPOST ${roomid} ${pretty(body)}`, 'color:lightblue;font-weight:bold');
             const response = await fetch(`/${roomid}`, { method: 'POST', body: JSON.stringify(body), headers: json_headers() })
             const result = await response.json();
             return result;
@@ -124,6 +150,16 @@
             headers.append('Content-Type', 'application/json');
             return headers;
         }
+
+        function pretty(it) {
+            if (typeof it === 'object') {
+                const out = Object.entries(it).map(([k, v]) => `${k}:${pretty(v)}`)
+                return `{ ${out.join(', ')} }`;
+            } else {
+                return it?.toString();
+            }
+        }
+
     </script>
 </body>
 
