@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>shuttle-ramp</title>
+</head>
+
+<body>
+    <button id="btn-offer-file">Offer file</button>
+    <script type="module">
+        main();
+
+        async function main() {
+            document.getElementById('btn-offer-file').addEventListener('click', offerFile);
+
+            await loop_post_room_message();
+            get_room_messages('1234', handle_room_message);
+
+            async function loop_post_room_message() {
+                const result = await post_room_message('1234', { msg: 'fun', time: Date.now() });
+                console.log(result);
+                setTimeout(loop_post_room_message, 10000);
+            }
+
+            async function handle_room_message(roomid, message) {
+                if (message.msg === 'offer_file') {
+                    // create connection, offer, send accept file with offer
+                    await post_room_message('1234', { msg: 'accept_file_offer_connection', file: message.file });
+                    // on connection established, receive file
+                    // on connection closed, tell user
+                } else if (message.msg === 'accept_file_offer_connection') {
+                    // create connection, set offer, create answer, send answer
+                    await post_room_message('1234', { msg: 'answer_connection' })
+                    // on connection established send file
+                    // when file is sent, close connection
+                } else if (message.msg === 'answer_connection') {
+                    // connection, set answer
+                }
+            }
+
+            await post_room_message('1234', { msg: 'ensure_room' })
+
+            await post_room_message('1234', { msg: 'ensure_room' })
+
+            // const connection = new RTCPeerConnection();
+            // log_connection_events(connection)
+
+            // const channel = connection.createDataChannel('ramp');
+            // log_data_channel_events(channel);
+
+            // const offer = await connection.createOffer();
+            // await connection.setLocalDescription(offer);
+        }
+
+        async function offerFile() {
+            const [fileHandle] = await window.showOpenFilePicker({ id: 'offer-file' });
+            const file = await fileHandle.getFile();
+            console.log(' file', await file.text());
+        }
+
+        function log_connection_events(connection) {
+            for (const eventname of [
+                'connectionstatechange',
+                'datachannel',
+                'icecandidate',
+                'icecandidateerror',
+                'iceconnectionstatechange',
+                'icegatheringstatechange',
+                'negotiationneeded',
+                'signalingstatechange',
+                'track',
+            ]) {
+                connection.addEventListener(eventname, () => {
+                    console.log('connection', eventname);
+                    console.log('  iceGatheringState', connection.iceGatheringState)
+                });
+            }
+        }
+
+        function log_data_channel_events(channel) {
+            for (const eventname of [
+                'bufferedamountlow',
+                'close',
+                'closing',
+                'error',
+                'message',
+                'open',
+            ]) {
+                channel.addEventListener(eventname, () => console.log('channel', eventname));
+            }
+        }
+
+        function connection_handle_offer_signalling(connection) {
+            let sentOffer = false;
+            connection.addEventListener('icecandidate', async (ev) => {
+                if (connection.iceGatheringState === 'complete') {
+                    if (sentOffer) return;
+                    sentOffer = true;
+                    // sdp will contain a=candidate lines
+                    const result = await post_room_message("1234", { msg: 'offer', sdp: connection.localDescription.sdp });
+                    console.log("POST /1234 offer, response", result);
+                }
+            })
+        }
+
+        async function post_room_message(roomid, body) {
+            const response = await fetch(`/${roomid}`, { method: 'POST', body: JSON.stringify(body), headers: json_headers() })
+            const result = await response.json();
+            return result;
+        }
+
+        function get_room_messages(roomid, handler) {
+            const src = new EventSource(`/${roomid}`);
+            src.onmessage = (ev) => {
+                const json = JSON.parse(ev.data);
+                handler(roomid, json);
+            }
+        }
+
+        function json_headers() {
+            const headers = new Headers();
+            headers.append('Content-Type', 'application/json');
+            return headers;
+        }
+    </script>
+</body>
+
+</html>
