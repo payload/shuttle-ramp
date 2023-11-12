@@ -39,7 +39,7 @@
                 await post_room_message(roomid, { msg: 'answer_connection', answer_sdp });
                 await connection.until_channel_open();
                 const file = await filePicker;
-                console.log('stream file', to_mb(file.size));
+                console.log('stream file', to_mb(file.size), file.size);
                 const receivedEOF = new Promise((resolve) => connection.channel.onmessage = (ev) => {
                     if (typeof ev.data === 'string') {
                         for (const line of ev.data.split('\n')) {
@@ -48,29 +48,15 @@
                     }
                 });
 
-                await file.stream().pipeTo(new WritableStream({
-                    async write(chunk, ctrl) {
-                        const sliceSize = connection.channel.bufferedAmountLowThreshold;
-                        const slices = Math.ceil(chunk.byteLength / sliceSize);
-                        console.log(`${now()} chunk ${to_mb(chunk.byteLength)} ${slices} slices. ${chunk.byteLength} bytes`);
-                        for (let start = 0; start < chunk.buffer.byteLength; start += sliceSize) {
-                            const end = Math.min(chunk.byteLength, start + sliceSize);
-                            const slice = chunk.buffer.slice(start, end);
-                            connection.channel.send(slice);
 
-                            if (connection.channel.bufferedAmount > connection.channel.bufferedAmountLowThreshold) {
-                                await connection.until_buffered_amount_low();
-                            }
-                        }
-                    }
-                }, new ByteLengthQueuingStrategy({ highWaterMark: connection.channel.bufferedAmountLowThreshold }))).then(DONE('stream file'));
 
-                if (connection.channel.readyState === "open") {
-                    connection.channel.send('EOF');
-                } else {
-                    console.error('channel not open anymore :(');
-                }
+                const smallerChunks = new SmallerChunksForDataChannel(connection.channel);
+                await file.stream()
+                    .pipeThrough(new TransformStream(smallerChunks, smallerChunks.pacing, smallerChunks.pacing))
+                    .pipeTo(new WritableStream(new WriteToDataChannel(connection.channel)))
+                    .then(DONE('stream file'));
 
+                connection.channel.send('EOF');
                 await receivedEOF.then(DONE('EOF'));
                 await connection.close_channel();
                 console.debug('offerFile: DONE');
@@ -116,11 +102,53 @@
             }
         }
 
+        class WriteToDataChannel {
+            constructor(channel) {
+                this.channel = channel;
+            }
+
+            async write(chunk, ctrl) {
+                try {
+                    this.channel.send(chunk); // chunk should not be too big, 2**18 worked
+                } catch (e) {
+                    if (/send queue is full/.test(e.message)) {
+                        await new Promise(resolve => this.channel.addEventListener('bufferedamountlow', resolve, { once: true }));
+                        this.channel.send(chunk);
+                    } else {
+                        throw e;
+                    }
+                }
+            }
+        }
+
+        class SmallerChunksForDataChannel {
+            constructor(channel) {
+                this.channel = channel;
+                this.pacing = new ByteLengthQueuingStrategy({ highWaterMark: channel.bufferedAmountLowThreshold });
+            }
+
+            async transform(chunk, ctrl) {
+                if ('byteLength' in chunk && 'buffer' in chunk && 'slice' in chunk.buffer) {
+                    const sliceSize = this.channel.bufferedAmountLowThreshold >= 1024 ? this.channel.bufferedAmountLowThreshold : 2 ** 18;
+                    console.log(`send chunk ${to_mb(chunk.byteLength)} in ${Math.ceil(chunk.byteLength / sliceSize)} slices, ${this.channel.bufferedAmountLowThreshold}`);
+                    for (let start = 0; start < chunk.byteLength; start += sliceSize) {
+                        const end = Math.min(chunk.byteLength, start + sliceSize);
+                        const slice = chunk.buffer.slice(start, end);
+                        ctrl.enqueue(slice);
+                        await new Promise(r => setTimeout(r), 0); // smooth this loop, prevent blocking
+                    }
+                } else {
+                    throw Error(`unimplemented for ${chunk.constructor?.name ?? typeof chunk}`);
+                }
+            }
+        }
+
         class OfferingConnection {
             connection = new RTCPeerConnection();
             channel = this.connection.createDataChannel('ramp');
             channel_open = undefined
             ondata = undefined
+            bytes = 0
 
             constructor() {
                 // First attach loggers than attach other event handlers, to ensure order these loggers log first.
@@ -159,11 +187,13 @@
                 if (ev.data instanceof ArrayBuffer) {
                     /** @type ArrayBuffer */
                     const buf = ev.data;
+                    this.bytes += buf.byteLength;
                     await this.ondata?.(buf);
                 } else if (typeof ev.data === 'string') {
                     console.log('channel message:', ev.data);
                     for (const line of ev.data.split('\n')) {
                         if (line === 'EOF') {
+                            console.log('bytes:', this.bytes);
                             this.channel.send('EOF');
                         }
                     }
@@ -200,7 +230,7 @@
                 this.channel = ev.channel;
                 log_data_channel_events(this.channel);
                 log_data_channel_state(this.channel);
-                this.channel.bufferedAmountLowThreshold = 65536;
+                this.channel.bufferedAmountLowThreshold = 2 ** 18;
                 return this.channel;
             }
 
